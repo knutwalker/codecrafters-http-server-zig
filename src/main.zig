@@ -37,11 +37,16 @@ fn handle_request(req_try: anyerror!Request) Response {
     };
     std.log.debug("Request: {}", .{req});
 
-    if (req.method == .get and std.mem.eql(u8, req.target, "/")) {
-        return .{ .status = .OK };
-    } else {
-        return .{ .status = .@"Not Found" };
+    if (req.method != .get) return .{ .status = .@"Method Not Allowed" };
+
+    if (std.mem.eql(u8, req.target, "/")) return .{ .status = .OK };
+
+    if (std.mem.startsWith(u8, req.target, "/echo/")) {
+        const path = req.target[6..];
+        return .{ .status = .OK, .body = path };
     }
+
+    return .{ .status = .@"Not Found" };
 }
 
 const Response = struct {
@@ -54,7 +59,7 @@ const Response = struct {
         try writer.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(self.status), @tagName(self.status) });
 
         if (self.status == .@"Method Not Allowed") {
-            try writer.print("Allow: GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE\r\n", .{});
+            try writer.print("Allow: GET\r\n", .{});
         }
         if (self.body) |body| {
             try writer.print("Content-Length: {}\r\n", .{body.len});
