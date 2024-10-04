@@ -43,6 +43,11 @@ fn handle_request(alloc: Alloc, reader: anytype) !Response {
         return req.respond_with(alloc, .OK, req.target[6..]);
     }
 
+    if (mem.eql(u8, req.target, "/user-agent")) {
+        const user_agent = full_req.headers.get("user-agent") orelse return .{ .status = .@"Bad Request" };
+        return req.respond_with(alloc, .OK, user_agent);
+    }
+
     return req.respond(.@"Not Found");
 }
 
