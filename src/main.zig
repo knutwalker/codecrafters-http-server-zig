@@ -61,51 +61,53 @@ fn handle_request(alloc: Alloc, dir: fs.Dir, reader: anytype) !Response {
 
     const req = full_req.line;
 
-    if (mem.eql(u8, req.target, "/")) return req.respond(.OK);
+    if (mem.eql(u8, req.target, "/")) return req.respond(.OK, .{});
 
     if (mem.startsWith(u8, req.target, "/echo/")) {
-        return req.respond_with(alloc, .OK, req.target[6..]);
+        const encoding = full_req.headers.accept_encoding() orelse .none; // return req.respond(.@"Not Acceptable", .{});
+        return req.respond(.OK, .{ req.target[6..], alloc, encoding });
     }
 
     if (mem.eql(u8, req.target, "/user-agent")) {
-        const user_agent = full_req.headers.get("user-agent") orelse return .{ .status = .@"Bad Request" };
-        return req.respond_with(alloc, .OK, user_agent);
+        const user_agent = full_req.headers.get("user-agent") orelse return req.respond(.@"Bad Request", .{});
+        return req.respond(.OK, .{ user_agent, alloc });
     }
 
     if (mem.startsWith(u8, req.target, "/files/")) {
         const file_name = req.target[7..];
         if (req.method == .get or req.method == .head) {
             const file_handle = dir.openFile(file_name, .{}) catch |err| switch (err) {
-                error.FileNotFound => return req.respond(.@"Not Found"),
-                else => return req.respond(.@"Internal Server Error"),
+                error.FileNotFound => return req.respond(.@"Not Found", .{}),
+                else => return req.respond(.@"Internal Server Error", .{}),
             };
 
-            const fs_stat = file_handle.stat() catch return req.respond(.@"Internal Server Error");
+            const fs_stat = file_handle.stat() catch return req.respond(.@"Internal Server Error", .{});
             const file = Response.File{ .file = file_handle, .len = fs_stat.size };
-            return req.respond_from(.OK, file);
+            return req.respond(.OK, .{file});
         } else if (req.method == .post) {
-            const req_body = full_req.body orelse return req.respond(.@"Unprocessable Content");
+            const req_body = full_req.body orelse return req.respond(.@"Unprocessable Content", .{});
 
             const file_handle = dir.createFile(file_name, .{ .exclusive = true }) catch |err| switch (err) {
-                error.PathAlreadyExists => return req.respond(.Conflict),
-                else => return req.respond(.@"Internal Server Error"),
+                error.PathAlreadyExists => return req.respond(.Conflict, .{}),
+                else => return req.respond(.@"Internal Server Error", .{}),
             };
             defer file_handle.close();
 
-            file_handle.writeAll(req_body) catch return req.respond(.@"Internal Server Error");
+            file_handle.writeAll(req_body) catch return req.respond(.@"Internal Server Error", .{});
 
-            return req.respond(.Created);
+            return req.respond(.Created, .{});
         } else {
-            return req.respond(.@"Method Not Allowed");
+            return req.respond(.@"Method Not Allowed", .{});
         }
     }
 
-    return req.respond(.@"Not Found");
+    return req.respond(.@"Not Found", .{});
 }
 
 const Response = struct {
     status: Status,
     method: RequestLine.Method = .get,
+    encoding: Headers.Encoding = .none,
     body: ?Content = null,
 
     const Self = @This();
@@ -135,6 +137,9 @@ const Response = struct {
 
         if (self.body) |body| {
             try writer.print("Content-Type: {s}\r\n", .{body.content_type()});
+            if (self.encoding == .gzip) {
+                try writer.print("Content-Encoding: gzip\r\n", .{});
+            }
         }
         try writer.print("\r\n", .{});
 
@@ -324,17 +329,21 @@ const RequestLine = struct {
         return .{ .method = method, .target = target };
     }
 
-    fn respond(self: @This(), status: Response.Status) Response {
-        return .{ .status = status, .method = self.method };
-    }
-
-    fn respond_with(req: @This(), alloc: Alloc, status: Response.Status, body: []const u8) !Response {
-        const owned_body = try alloc.dupe(u8, body);
-        return .{ .status = status, .method = req.method, .body = .{ .text = owned_body } };
-    }
-
-    fn respond_from(req: @This(), status: Response.Status, file: Response.File) !Response {
-        return .{ .status = status, .method = req.method, .body = .{ .file = file } };
+    fn respond(req: @This(), status: Response.Status, args: anytype) !Response {
+        if (args.len == 0) {
+            return .{ .status = status, .method = req.method };
+        }
+        switch (@TypeOf(args[0])) {
+            []const u8 => {
+                const owned_body = try args[1].dupe(u8, args[0]);
+                const encoding = if (args.len > 2) args[2] else .none;
+                return .{ .status = status, .method = req.method, .encoding = encoding, .body = .{ .text = owned_body } };
+            },
+            Response.File => {
+                return .{ .status = status, .method = req.method, .body = .{ .file = args[0] } };
+            },
+            else => @compileError("Invalid response type"),
+        }
     }
 
     const max_method_len = @tagName(std.sort.max(Method, std.meta.tags(Method), {}, struct {
@@ -369,6 +378,12 @@ const Headers = struct {
         if (self.contains("transfer-encoding")) return null;
         const header = self.get("content-length") orelse return null;
         return std.fmt.parseInt(usize, header, 10) catch return Error.MalformedRequest;
+    }
+
+    fn accept_encoding(self: *const Self) ?Encoding {
+        const header = self.get("accept-encoding") orelse return .none;
+        if (mem.eql(u8, header, "gzip")) return .gzip;
+        return null;
     }
 
     fn parse(alloc: Alloc, reader: anytype) !Self {
@@ -406,6 +421,8 @@ const Headers = struct {
             alloc.free(self.value);
         }
     };
+
+    const Encoding = enum { none, gzip };
 
     fn parse_next(alloc: Alloc, reader: anytype) !?Header {
         const line = try read_line(reader);
