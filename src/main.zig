@@ -2,6 +2,24 @@ pub fn main() !void {
     var alloc = std.heap.GeneralPurposeAllocator(.{}){};
     defer if (alloc.deinit() != .ok) @panic("memory leak");
 
+    var dir = b: {
+        var allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer allocator.deinit();
+
+        const args = try std.process.argsAlloc(allocator.allocator());
+        defer std.process.argsFree(allocator.allocator(), args);
+
+        var arg_values = mem.window([]const u8, args, 2, 1);
+        while (arg_values.next()) |arg_value| {
+            if (mem.eql(u8, arg_value[0], "--directory")) {
+                break :b try fs.openDirAbsolute(arg_value[1], .{});
+            }
+        }
+
+        break :b fs.cwd();
+    };
+    defer dir.close();
+
     const address = try net.Address.resolveIp("127.0.0.1", 4221);
     var listener = try address.listen(.{
         .reuse_address = true,
@@ -13,18 +31,18 @@ pub fn main() !void {
 
     while (true) {
         const connection = try listener.accept();
-        try pool.spawn(handle_connection, .{ alloc.allocator(), connection });
+        try pool.spawn(handle_connection, .{ alloc.allocator(), dir, connection });
     }
 }
 
-fn handle_connection(alloc: Alloc, connection: net.Server.Connection) void {
+fn handle_connection(alloc: Alloc, dir: fs.Dir, connection: net.Server.Connection) void {
     log.debug("client connected from {}!", .{connection.address});
 
-    const res = handle_request(alloc, connection.stream.reader()) catch @panic("oom");
+    const res = handle_request(alloc, dir, connection.stream.reader()) catch @panic("oom");
     defer res.deinit(alloc);
     log.debug("Response: {}", .{res.status});
 
-    if (res.send(connection.stream.writer())) |_| {
+    if (res.send(connection.stream)) |_| {
         connection.stream.close();
     } else |err| switch (err) {
         error.BrokenPipe => {},
@@ -32,7 +50,7 @@ fn handle_connection(alloc: Alloc, connection: net.Server.Connection) void {
     }
 }
 
-fn handle_request(alloc: Alloc, reader: anytype) !Response {
+fn handle_request(alloc: Alloc, dir: fs.Dir, reader: anytype) !Response {
     const full_req = Request.parse(alloc, reader) catch |err| switch (err) {
         error.EndOfStream, Error.MalformedRequest => return .{ .status = .@"Bad Request" },
         Error.UnsupportedHttpVersion => return .{ .status = .@"HTTP Version Not Supported" },
@@ -56,23 +74,36 @@ fn handle_request(alloc: Alloc, reader: anytype) !Response {
         return req.respond_with(alloc, .OK, user_agent);
     }
 
+    if (mem.startsWith(u8, req.target, "/files/")) {
+        const file_name = req.target[7..];
+        const file_handle = dir.openFile(file_name, .{}) catch |err| switch (err) {
+            error.FileNotFound => return req.respond(.@"Not Found"),
+            else => return req.respond(.@"Internal Server Error"),
+        };
+
+        const fs_stat = file_handle.stat() catch return req.respond(.@"Internal Server Error");
+        const file = Response.File{ .file = file_handle, .len = fs_stat.size };
+        return req.respond_from(.OK, file);
+    }
+
     return req.respond(.@"Not Found");
 }
 
 const Response = struct {
     status: Status,
     method: RequestLine.Method = .get,
-    body: ?[]const u8 = null,
+    body: ?Content = null,
 
     const Self = @This();
 
     fn deinit(self: Self, alloc: Alloc) void {
         if (self.body) |body| {
-            alloc.free(body);
+            body.deinit(alloc);
         }
     }
 
-    fn send(self: Self, writer: anytype) !void {
+    fn send(self: Self, stream: net.Stream) !void {
+        const writer = stream.writer();
         try writer.print("HTTP/1.1 {}\r\n", .{self.status});
 
         if (self.status == .@"Method Not Allowed") {
@@ -84,18 +115,18 @@ const Response = struct {
             @intFromEnum(self.status) / 100 == 1 or @intFromEnum(self.status) == 204
         // A server MUST NOT send a Content-Length header field in any 2xx response to a CONNECT request
         or (self.method == .connect and @intFromEnum(self.status) / 1 == 2))) {
-            const len = if (self.body) |body| body.len else 0;
+            const len = if (self.body) |body| body.content_length() else 0;
             try writer.print("Content-Length: {}\r\n", .{len});
         }
 
-        if (self.body) |_| {
-            try writer.print("Content-Type: text/plain\r\n", .{});
+        if (self.body) |body| {
+            try writer.print("Content-Type: {s}\r\n", .{body.content_type()});
         }
         try writer.print("\r\n", .{});
 
         if (self.method != .head) {
             if (self.body) |body| {
-                try writer.writeAll(body);
+                try body.send(stream);
             }
         }
     }
@@ -152,6 +183,53 @@ const Response = struct {
             _ = args;
             try writer.print("{d} {s}", .{ @intFromEnum(self), @tagName(self) });
         }
+    };
+
+    const Content = union(enum) {
+        text: []const u8,
+        file: File,
+
+        fn content_type(self: @This()) []const u8 {
+            return switch (self) {
+                .text => "text/plain",
+                .file => "application/octet-stream",
+            };
+        }
+
+        fn content_length(self: @This()) usize {
+            switch (self) {
+                .text => |text| return text.len,
+                .file => |file| return file.len,
+            }
+        }
+
+        fn send(self: @This(), out: net.Stream) !void {
+            switch (self) {
+                .text => |text| try out.writeAll(text),
+                .file => |file| {
+                    var offset: u64 = 0;
+                    var len: u64 = file.len;
+
+                    while (len > 0) {
+                        const sent = try std.posix.sendfile(out.handle, file.file.handle, offset, len, &.{}, &.{}, 0);
+                        offset +|= sent;
+                        len -|= sent;
+                    }
+                },
+            }
+        }
+
+        fn deinit(self: @This(), alloc: Alloc) void {
+            switch (self) {
+                .text => |text| alloc.free(text),
+                .file => |file| file.file.close(),
+            }
+        }
+    };
+
+    const File = struct {
+        file: fs.File,
+        len: u64,
     };
 };
 
@@ -234,7 +312,11 @@ const RequestLine = struct {
 
     fn respond_with(req: @This(), alloc: Alloc, status: Response.Status, body: []const u8) !Response {
         const owned_body = try alloc.dupe(u8, body);
-        return .{ .status = status, .method = req.method, .body = owned_body };
+        return .{ .status = status, .method = req.method, .body = .{ .text = owned_body } };
+    }
+
+    fn respond_from(req: @This(), status: Response.Status, file: Response.File) !Response {
+        return .{ .status = status, .method = req.method, .body = .{ .file = file } };
     }
 
     const max_method_len = @tagName(std.sort.max(Method, std.meta.tags(Method), {}, struct {
@@ -352,6 +434,7 @@ const Error = error{
 
 const std = @import("std");
 const Alloc = mem.Allocator;
+const fs = std.fs;
 const log = std.log;
 const mem = std.mem;
 const net = std.net;
