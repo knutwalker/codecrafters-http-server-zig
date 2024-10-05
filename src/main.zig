@@ -382,7 +382,10 @@ const Headers = struct {
 
     fn accept_encoding(self: *const Self) ?Encoding {
         const header = self.get("accept-encoding") orelse return .none;
-        if (mem.eql(u8, header, "gzip")) return .gzip;
+        var values = mem.splitScalar(u8, header, ',');
+        while (values.next()) |value| {
+            if (mem.eql(u8, mem.trim(u8, value, &std.ascii.whitespace), "gzip")) return .gzip;
+        }
         return null;
     }
 
