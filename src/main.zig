@@ -1,13 +1,12 @@
+var running: thread.ResetEvent = .{};
+
 pub fn main() !void {
     var alloc = std.heap.GeneralPurposeAllocator(.{}){};
     defer if (alloc.deinit() != .ok) @panic("memory leak");
 
     var dir = b: {
-        var allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer allocator.deinit();
-
-        const args = try std.process.argsAlloc(allocator.allocator());
-        defer std.process.argsFree(allocator.allocator(), args);
+        const args = try std.process.argsAlloc(alloc.allocator());
+        defer std.process.argsFree(alloc.allocator(), args);
 
         var arg_values = mem.window([]const u8, args, 2, 1);
         while (arg_values.next()) |arg_value| {
@@ -16,9 +15,9 @@ pub fn main() !void {
             }
         }
 
-        break :b fs.cwd();
+        break :b null;
     };
-    defer dir.close();
+    defer if (dir) |*d| d.close();
 
     const address = try net.Address.resolveIp("127.0.0.1", 4221);
     var listener = try address.listen(.{
@@ -28,87 +27,140 @@ pub fn main() !void {
 
     var pool: thread.Pool = undefined;
     try pool.init(.{ .allocator = alloc.allocator() });
+    defer pool.deinit();
 
-    while (true) {
-        const connection = try listener.accept();
-        try pool.spawn(handle_connection, .{ alloc.allocator(), dir, connection });
+    var server = try thread.spawn(.{}, main_server, .{ listener, dir, &pool, alloc.allocator() });
+    server.detach();
+
+    running.wait();
+
+    log.debug("Shutting down...", .{});
+}
+
+fn main_server(server: net.Server, dir: ?fs.Dir, pool: *thread.Pool, alloc: Alloc) void {
+    var listener = server;
+    while (!running.isSet()) {
+        const connection = listener.accept() catch continue;
+        pool.spawn(handle_connection, .{ alloc, dir, connection }) catch {
+            handle_connection(alloc, dir, connection);
+        };
     }
 }
 
-fn handle_connection(alloc: Alloc, dir: fs.Dir, connection: net.Server.Connection) void {
+fn handle_connection(alloc: Alloc, dir: ?fs.Dir, connection: net.Server.Connection) void {
     log.debug("client connected from {}!", .{connection.address});
 
-    const res = handle_request(alloc, dir, connection.stream.reader()) catch @panic("oom");
-    defer res.deinit(alloc);
-    log.debug("Response: {}", .{res.status});
+    try_handle_request(alloc, dir, connection.stream) catch |err| {
+        log.warn("Caught error: {s}", .{@errorName(err)});
+        const error_response: Response = switch (err) {
+            error.EndOfStream, error.MalformedRequest, error.PathAlreadyExists => .{ .status = .@"Bad Request" },
+            error.NotFound, error.FileNotFound => .{ .status = .@"Not Found" },
+            error.UnsupportedHttpVersion => .{ .status = .@"HTTP Version Not Supported" },
+            error.UnknownMethod => .{ .status = .@"Method Not Allowed" },
+            else => b: {
+                log.err("Unhandled error: {s}", .{@errorName(err)});
+                break :b .{ .status = .@"Internal Server Error" };
+            },
+        };
+        log.debug("Sending error response: {any}", .{error_response});
 
-    if (res.send(connection.stream)) |_| {
-        connection.stream.close();
-    } else |err| switch (err) {
-        error.BrokenPipe => {},
-        else => @panic("oops"),
-    }
-}
-
-fn handle_request(alloc: Alloc, dir: fs.Dir, reader: anytype) !Response {
-    const full_req = Request.parse(alloc, reader) catch |err| switch (err) {
-        error.EndOfStream, Error.MalformedRequest => return .{ .status = .@"Bad Request" },
-        Error.UnsupportedHttpVersion => return .{ .status = .@"HTTP Version Not Supported" },
-        Error.UnknownMethod => return .{ .status = .@"Method Not Allowed" },
-        else => return .{ .status = .@"Internal Server Error" },
+        error_response.safe_send(connection.stream, .{});
     };
-    defer full_req.deinit(alloc);
-
-    const req = full_req.line;
-
-    if (mem.eql(u8, req.target, "/")) return req.respond(.OK, .{});
-
-    if (mem.startsWith(u8, req.target, "/echo/")) {
-        const encoding = full_req.headers.accept_encoding() orelse .none;
-        const text = req.target[6..];
-        if (encoding == .gzip) {
-            const content = compress(alloc, text) catch return req.respond(.@"Internal Server Error", .{});
-            return req.respond(.OK, .{content});
-        } else {
-            return req.respond(.OK, .{ text, alloc });
-        }
-    }
-
-    if (mem.eql(u8, req.target, "/user-agent")) {
-        const user_agent = full_req.headers.get("user-agent") orelse return req.respond(.@"Bad Request", .{});
-        return req.respond(.OK, .{ user_agent, alloc });
-    }
-
-    if (mem.startsWith(u8, req.target, "/files/")) {
-        const file_name = req.target[7..];
-        if (req.method == .get or req.method == .head) {
-            const file_handle = dir.openFile(file_name, .{}) catch |err| switch (err) {
-                error.FileNotFound => return req.respond(.@"Not Found", .{}),
-                else => return req.respond(.@"Internal Server Error", .{}),
-            };
-
-            const fs_stat = file_handle.stat() catch return req.respond(.@"Internal Server Error", .{});
-            const file = Response.File{ .file = file_handle, .len = fs_stat.size };
-            return req.respond(.OK, .{file});
-        } else if (req.method == .post) {
-            const req_body = full_req.body orelse return req.respond(.@"Unprocessable Content", .{});
-
-            const file_handle = dir.createFile(file_name, .{ .exclusive = true }) catch |err| switch (err) {
-                error.PathAlreadyExists => return req.respond(.Conflict, .{}),
-                else => return req.respond(.@"Internal Server Error", .{}),
-            };
-            defer file_handle.close();
-
-            file_handle.writeAll(req_body) catch return req.respond(.@"Internal Server Error", .{});
-
-            return req.respond(.Created, .{});
-        } else {
-            return req.respond(.@"Method Not Allowed", .{});
-        }
-    }
-
-    return req.respond(.@"Not Found", .{});
 }
+
+fn try_handle_request(alloc: Alloc, dir: ?fs.Dir, stream: net.Stream) !void {
+    const req = try Request.parse(alloc, stream.reader());
+    defer req.deinit(alloc);
+
+    if (req.line.method == .post and mem.eql(u8, req.line.target, "/shutdown")) {
+        running.set();
+        req.line.respond(.OK, .{}).safe_send(stream, .{});
+        return;
+    }
+
+    const route = Routes.match(req.line.target) orelse return error.NotFound;
+    try route.handle(alloc, dir, req, stream);
+}
+
+const Routes = union(enum) {
+    root,
+    echo: []const u8,
+    user_agent,
+    file: []const u8,
+
+    fn match(target: []const u8) ?Routes {
+        inline for (std.meta.tags(std.meta.Tag(Routes))) |tag| switch (tag) {
+            .root => if (mem.eql(u8, target, "/")) return .root,
+            .echo => if (mem.startsWith(u8, target, "/echo/")) return .{ .echo = target[6..] },
+            .user_agent => if (mem.eql(u8, target, "/user-agent")) return .user_agent,
+            .file => if (mem.startsWith(u8, target, "/files/")) return .{ .file = target[7..] },
+        };
+        return null;
+    }
+
+    fn handle(route: @This(), alloc: Alloc, dir: ?fs.Dir, req: Request, stream: net.Stream) !void {
+        switch (route) {
+            .root => respond(req, .OK, stream, .{}),
+            .echo => |text| {
+                if (req.headers.accepts_encoding("gzip")) {
+                    var content = try std.ArrayListUnmanaged(u8).initCapacity(alloc, 0);
+                    defer content.deinit(alloc);
+                    var fio = std.io.fixedBufferStream(text);
+                    try std.compress.gzip.compress(fio.reader(), content.writer(alloc), .{});
+                    respond(req, .OK, stream, .{ content.items, .{.{ "Content-Encoding", "gzip" }} });
+                } else {
+                    respond(req, .OK, stream, .{text});
+                }
+            },
+            .user_agent => {
+                const user_agent = req.headers.get("user-agent") orelse return error.MalformedRequest;
+                respond(req, .OK, stream, .{user_agent});
+            },
+            .file => |file_name| {
+                if (req.line.method == .get or req.line.method == .head) {
+                    const root_dir = dir orelse fs.cwd();
+                    const file_handle = try root_dir.openFile(file_name, .{});
+                    defer file_handle.close();
+                    const fs_stat = try file_handle.stat();
+                    const file = Response.File{ .file = file_handle, .len = fs_stat.size };
+                    respond(req, .OK, stream, .{file});
+                } else if (req.line.method == .post) {
+                    const content_length = try req.headers.content_length() orelse 0;
+                    log.debug("Content-Length: {d}", .{content_length});
+                    if (content_length == 0) return error.MalformedRequest;
+
+                    const root_dir = dir orelse fs.cwd();
+                    const file_handle = try root_dir.createFile(file_name, .{ .exclusive = true });
+                    defer file_handle.close();
+
+                    // reading to end if the input would block until the connection is closed
+                    var limit_reader = std.io.limitedReader(stream.reader(), content_length);
+                    var buf: [mem.page_size]u8 = undefined;
+                    var len: u64 = content_length;
+
+                    while (true) {
+                        const read = try limit_reader.read(&buf);
+                        log.debug("Read: {d}", .{read});
+                        if (read == 0) break;
+
+                        try file_handle.writeAll(buf[0..read]);
+                        len -|= read;
+                    }
+
+                    respond(req, .Created, stream, .{});
+                } else {
+                    respond(req, .@"Method Not Allowed", stream, .{});
+                }
+            },
+        }
+    }
+
+    fn respond(req: Request, status: Response.Status, stream: net.Stream, args: anytype) void {
+        const response = req.line.respond(status, args);
+        log.debug("Response: {}", .{response.status});
+        response.safe_send(stream, if (args.len > 1) args[1] else .{});
+    }
+};
 
 const Response = struct {
     status: Status,
@@ -123,29 +175,36 @@ const Response = struct {
         }
     }
 
-    fn send(self: Self, stream: net.Stream) !void {
+    fn safe_send(self: Self, stream: net.Stream, headers: anytype) void {
+        if (self.send(stream, headers)) {
+            // stream.close();
+        } else |err| switch (err) {
+            error.BrokenPipe => {
+                log.debug("Broken pipe", .{});
+            },
+            else => @panic("oops"),
+        }
+    }
+
+    fn send(self: Self, stream: net.Stream, headers: anytype) !void {
         const writer = stream.writer();
         try writer.print("HTTP/1.1 {}\r\n", .{self.status});
 
         if (self.status == .@"Method Not Allowed") {
-            try writer.print("Allow: GET, HEAD\r\n", .{});
+            try writer.print("Allow: GET, HEAD, POST\r\n", .{});
         }
 
-        if (!(
-        // A server MUST NOT send a Content-Length header field in any response with a status code of 1xx or 204
-            @intFromEnum(self.status) / 100 == 1 or @intFromEnum(self.status) == 204
-        // A server MUST NOT send a Content-Length header field in any 2xx response to a CONNECT request
-        or (self.method == .connect and @intFromEnum(self.status) / 1 == 2))) {
-            const len = if (self.body) |body| body.content_length() else 0;
-            try writer.print("Content-Length: {}\r\n", .{len});
-        }
+        const len = if (self.body) |body| body.content_length() else 0;
+        try writer.print("Content-Length: {}\r\n", .{len});
 
         if (self.body) |body| {
             try writer.print("Content-Type: {s}\r\n", .{body.content_type()});
-            if (body == .zip) {
-                try writer.print("Content-Encoding: gzip\r\n", .{});
-            }
         }
+
+        inline for (headers) |header| {
+            try writer.print("{s}: {s}\r\n", header);
+        }
+
         try writer.print("\r\n", .{});
 
         if (self.method != .head) {
@@ -211,26 +270,25 @@ const Response = struct {
 
     const Content = union(enum) {
         text: []const u8,
-        zip: []const u8,
         file: File,
 
         fn content_type(self: @This()) []const u8 {
             return switch (self) {
-                .text, .zip => "text/plain",
+                .text => "text/plain",
                 .file => "application/octet-stream",
             };
         }
 
         fn content_length(self: @This()) usize {
             switch (self) {
-                .text, .zip => |text| return text.len,
+                .text => |text| return text.len,
                 .file => |file| return file.len,
             }
         }
 
         fn send(self: @This(), out: net.Stream) !void {
             switch (self) {
-                .text, .zip => |text| try out.writeAll(text),
+                .text => |text| try out.writeAll(text),
                 .file => |file| {
                     var offset: u64 = 0;
                     var len: u64 = file.len;
@@ -261,7 +319,6 @@ const Response = struct {
 const Request = struct {
     line: RequestLine,
     headers: Headers,
-    body: ?[]const u8 = null,
 
     const Self = @This();
 
@@ -272,28 +329,13 @@ const Request = struct {
         const headers = try Headers.parse(alloc, reader);
         errdefer headers.deinit(alloc);
 
-        const body_len = try headers.content_length();
-        log.debug("Content-Length: {?d}", .{body_len});
-
-        const body = if (body_len orelse 0 > 0) b: {
-            const content_length = body_len.?;
-            log.debug("Reading body for size: {d}", .{content_length});
-
-            var limit_reader = std.io.limitedReader(reader, content_length);
-            const req_body = try limit_reader.reader().readAllAlloc(alloc, std.math.maxInt(usize));
-
-            log.debug("Body: len={d} head={s}", .{ req_body.len, req_body[0..@min(42, req_body.len)] });
-            break :b req_body;
-        } else null;
-
         log.debug("Request: {}", .{line});
-        return .{ .line = line, .headers = headers, .body = body };
+        return .{ .line = line, .headers = headers };
     }
 
     fn deinit(self: @This(), alloc: Alloc) void {
         self.line.deinit(alloc);
         self.headers.deinit(alloc);
-        if (self.body) |body| alloc.free(body);
     }
 };
 
@@ -316,41 +358,34 @@ const RequestLine = struct {
 
         var segments = mem.splitScalar(u8, line, ' ');
         inline for (std.meta.fields(Segments)) |field_info| {
-            const segment = segments.next() orelse return Error.MalformedRequest;
+            const segment = segments.next() orelse return error.MalformedRequest;
             @field(segmented, field_info.name) = segment;
         }
         log.debug("Parsed Request Line: method={s[method]}, path={s[path]}, version={s[version]}", segmented);
 
-        if (!mem.eql(u8, segmented.version, "HTTP/1.1")) return Error.UnsupportedHttpVersion;
-        if (segmented.method.len > max_method_len) return Error.UnknownMethod;
+        if (!ascii.eqlIgnoreCase(segmented.version, "HTTP/1.1")) return error.UnsupportedHttpVersion;
+        if (segmented.method.len > max_method_len) return error.UnknownMethod;
 
         var method_buf: [max_method_len]u8 = undefined;
-        const method_str = std.ascii.lowerString(&method_buf, segmented.method);
-        const method = std.meta.stringToEnum(Method, method_str) orelse return Error.UnknownMethod;
+        const method_str = ascii.lowerString(&method_buf, segmented.method);
+        const method = std.meta.stringToEnum(Method, method_str) orelse return error.UnknownMethod;
 
         const target = try alloc.dupe(u8, segmented.target);
 
         return .{ .method = method, .target = target };
     }
 
-    fn respond(req: @This(), status: Response.Status, args: anytype) !Response {
+    fn respond(req: @This(), status: Response.Status, args: anytype) Response {
         if (args.len == 0) {
             return .{ .status = status, .method = req.method };
         }
-        switch (@TypeOf(args[0])) {
-            []const u8 => {
-                if (args.len > 1) {
-                    const owned_body = try args[1].dupe(u8, args[0]);
-                    return .{ .status = status, .method = req.method, .body = .{ .text = owned_body } };
-                } else {
-                    return .{ .status = status, .method = req.method, .body = .{ .zip = args[0] } };
-                }
-            },
-            Response.File => {
-                return .{ .status = status, .method = req.method, .body = .{ .file = args[0] } };
-            },
-            else => @compileError("Invalid response type"),
-        }
+        const body: Response.Content = switch (@TypeOf(args[0])) {
+            []const u8, []u8 => .{ .text = args[0] },
+            Response.File => .{ .file = args[0] },
+            else => @compileError("Invalid response type: " ++ @typeName(@TypeOf(args[0]))),
+        };
+
+        return .{ .status = status, .method = req.method, .body = body };
     }
 
     const max_method_len = @tagName(std.sort.max(Method, std.meta.tags(Method), {}, struct {
@@ -372,7 +407,7 @@ const Headers = struct {
 
     fn get(self: *const Self, name: []const u8) ?[]const u8 {
         for (self.headers) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+            if (ascii.eqlIgnoreCase(header.name, name)) return header.value;
         }
         return null;
     }
@@ -381,19 +416,20 @@ const Headers = struct {
         return self.get(name) != null;
     }
 
-    fn content_length(self: *const Self) Error!?u64 {
+    fn content_length(self: *const Self) !?u64 {
         if (self.contains("transfer-encoding")) return null;
         const header = self.get("content-length") orelse return null;
-        return std.fmt.parseInt(u64, header, 10) catch return Error.MalformedRequest;
+        return std.fmt.parseInt(u64, header, 10) catch return error.MalformedRequest;
     }
 
-    fn accept_encoding(self: *const Self) ?Encoding {
-        const header = self.get("accept-encoding") orelse return .none;
-        var values = mem.splitScalar(u8, header, ',');
-        while (values.next()) |value| {
-            if (mem.eql(u8, mem.trim(u8, value, &std.ascii.whitespace), "gzip")) return .gzip;
+    fn accepts_encoding(self: *const Self, encoding: []const u8) bool {
+        if (self.get("accept-encoding")) |header| {
+            var values = mem.splitScalar(u8, header, ',');
+            while (values.next()) |value| {
+                if (ascii.eqlIgnoreCase(mem.trim(u8, value, &ascii.whitespace), encoding)) return true;
+            }
         }
-        return null;
+        return false;
     }
 
     fn parse(alloc: Alloc, reader: anytype) !Self {
@@ -444,8 +480,8 @@ const Headers = struct {
 
         var segments = mem.splitScalar(u8, line, ':');
         inline for (std.meta.fields(Header)) |field_info| {
-            const segment = segments.next() orelse return Error.MalformedRequest;
-            @field(header, field_info.name) = mem.trimLeft(u8, segment, &std.ascii.whitespace);
+            const segment = segments.next() orelse return error.MalformedRequest;
+            @field(header, field_info.name) = mem.trimLeft(u8, segment, &ascii.whitespace);
         }
         log.debug("Parsed Header Line: name={s[name]}, value={s[value]}", header);
 
@@ -466,27 +502,14 @@ fn read_line(reader: anytype) ![]u8 {
     try reader.streamUntilDelimiter(fbs.writer(), '\r', fbs.buffer.len);
 
     const next_byte = try reader.readByte();
-    if (next_byte != '\n') return Error.MalformedRequest;
+    if (next_byte != '\n') return error.MalformedRequest;
 
     return fbs.getWritten();
 }
 
-fn compress(alloc: Alloc, text: []const u8) ![]const u8 {
-    var content = try std.ArrayListUnmanaged(u8).initCapacity(alloc, 0);
-    defer content.deinit(alloc);
-    var fio = std.io.fixedBufferStream(text);
-    try std.compress.gzip.compress(fio.reader(), content.writer(alloc), .{});
-    return try content.toOwnedSlice(alloc);
-}
-
-const Error = error{
-    UnsupportedHttpVersion,
-    UnknownMethod,
-    MalformedRequest,
-};
-
 const std = @import("std");
 const Alloc = mem.Allocator;
+const ascii = std.ascii;
 const fs = std.fs;
 const log = std.log;
 const mem = std.mem;
