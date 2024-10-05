@@ -64,8 +64,14 @@ fn handle_request(alloc: Alloc, dir: fs.Dir, reader: anytype) !Response {
     if (mem.eql(u8, req.target, "/")) return req.respond(.OK, .{});
 
     if (mem.startsWith(u8, req.target, "/echo/")) {
-        const encoding = full_req.headers.accept_encoding() orelse .none; // return req.respond(.@"Not Acceptable", .{});
-        return req.respond(.OK, .{ req.target[6..], alloc, encoding });
+        const encoding = full_req.headers.accept_encoding() orelse .none;
+        const text = req.target[6..];
+        if (encoding == .gzip) {
+            const content = compress(alloc, text) catch return req.respond(.@"Internal Server Error", .{});
+            return req.respond(.OK, .{content});
+        } else {
+            return req.respond(.OK, .{ text, alloc });
+        }
     }
 
     if (mem.eql(u8, req.target, "/user-agent")) {
@@ -107,7 +113,6 @@ fn handle_request(alloc: Alloc, dir: fs.Dir, reader: anytype) !Response {
 const Response = struct {
     status: Status,
     method: RequestLine.Method = .get,
-    encoding: Headers.Encoding = .none,
     body: ?Content = null,
 
     const Self = @This();
@@ -137,7 +142,7 @@ const Response = struct {
 
         if (self.body) |body| {
             try writer.print("Content-Type: {s}\r\n", .{body.content_type()});
-            if (self.encoding == .gzip) {
+            if (body == .zip) {
                 try writer.print("Content-Encoding: gzip\r\n", .{});
             }
         }
@@ -206,25 +211,26 @@ const Response = struct {
 
     const Content = union(enum) {
         text: []const u8,
+        zip: []const u8,
         file: File,
 
         fn content_type(self: @This()) []const u8 {
             return switch (self) {
-                .text => "text/plain",
+                .text, .zip => "text/plain",
                 .file => "application/octet-stream",
             };
         }
 
         fn content_length(self: @This()) usize {
             switch (self) {
-                .text => |text| return text.len,
+                .text, .zip => |text| return text.len,
                 .file => |file| return file.len,
             }
         }
 
         fn send(self: @This(), out: net.Stream) !void {
             switch (self) {
-                .text => |text| try out.writeAll(text),
+                .text, .zip => |text| try out.writeAll(text),
                 .file => |file| {
                     var offset: u64 = 0;
                     var len: u64 = file.len;
@@ -240,7 +246,7 @@ const Response = struct {
 
         fn deinit(self: @This(), alloc: Alloc) void {
             switch (self) {
-                .text => |text| alloc.free(text),
+                .text, .zip => |text| alloc.free(text),
                 .file => |file| file.file.close(),
             }
         }
@@ -270,13 +276,11 @@ const Request = struct {
         log.debug("Content-Length: {?d}", .{body_len});
 
         const body = if (body_len orelse 0 > 0) b: {
-            log.debug("Reading body for size: {?d}", .{body_len});
+            const content_length = body_len.?;
+            log.debug("Reading body for size: {d}", .{content_length});
 
-            const to_read = body_len.?;
-            var body_buf = try std.ArrayListUnmanaged(u8).initCapacity(alloc, to_read);
-            body_buf.expandToCapacity();
-            try reader.readNoEof(body_buf.items);
-            const req_body = try body_buf.toOwnedSlice(alloc);
+            var limit_reader = std.io.limitedReader(reader, content_length);
+            const req_body = try limit_reader.reader().readAllAlloc(alloc, std.math.maxInt(usize));
 
             log.debug("Body: len={d} head={s}", .{ req_body.len, req_body[0..@min(42, req_body.len)] });
             break :b req_body;
@@ -335,9 +339,12 @@ const RequestLine = struct {
         }
         switch (@TypeOf(args[0])) {
             []const u8 => {
-                const owned_body = try args[1].dupe(u8, args[0]);
-                const encoding = if (args.len > 2) args[2] else .none;
-                return .{ .status = status, .method = req.method, .encoding = encoding, .body = .{ .text = owned_body } };
+                if (args.len > 1) {
+                    const owned_body = try args[1].dupe(u8, args[0]);
+                    return .{ .status = status, .method = req.method, .body = .{ .text = owned_body } };
+                } else {
+                    return .{ .status = status, .method = req.method, .body = .{ .zip = args[0] } };
+                }
             },
             Response.File => {
                 return .{ .status = status, .method = req.method, .body = .{ .file = args[0] } };
@@ -374,10 +381,10 @@ const Headers = struct {
         return self.get(name) != null;
     }
 
-    fn content_length(self: *const Self) Error!?usize {
+    fn content_length(self: *const Self) Error!?u64 {
         if (self.contains("transfer-encoding")) return null;
         const header = self.get("content-length") orelse return null;
-        return std.fmt.parseInt(usize, header, 10) catch return Error.MalformedRequest;
+        return std.fmt.parseInt(u64, header, 10) catch return Error.MalformedRequest;
     }
 
     fn accept_encoding(self: *const Self) ?Encoding {
@@ -462,6 +469,14 @@ fn read_line(reader: anytype) ![]u8 {
     if (next_byte != '\n') return Error.MalformedRequest;
 
     return fbs.getWritten();
+}
+
+fn compress(alloc: Alloc, text: []const u8) ![]const u8 {
+    var content = try std.ArrayListUnmanaged(u8).initCapacity(alloc, 0);
+    defer content.deinit(alloc);
+    var fio = std.io.fixedBufferStream(text);
+    try std.compress.gzip.compress(fio.reader(), content.writer(alloc), .{});
+    return try content.toOwnedSlice(alloc);
 }
 
 const Error = error{
