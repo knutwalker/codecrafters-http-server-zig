@@ -61,8 +61,6 @@ fn handle_request(alloc: Alloc, dir: fs.Dir, reader: anytype) !Response {
 
     const req = full_req.line;
 
-    if (req.method != .get and req.method != .head) return .{ .status = .@"Method Not Allowed" };
-
     if (mem.eql(u8, req.target, "/")) return req.respond(.OK);
 
     if (mem.startsWith(u8, req.target, "/echo/")) {
@@ -76,14 +74,30 @@ fn handle_request(alloc: Alloc, dir: fs.Dir, reader: anytype) !Response {
 
     if (mem.startsWith(u8, req.target, "/files/")) {
         const file_name = req.target[7..];
-        const file_handle = dir.openFile(file_name, .{}) catch |err| switch (err) {
-            error.FileNotFound => return req.respond(.@"Not Found"),
-            else => return req.respond(.@"Internal Server Error"),
-        };
+        if (req.method == .get or req.method == .head) {
+            const file_handle = dir.openFile(file_name, .{}) catch |err| switch (err) {
+                error.FileNotFound => return req.respond(.@"Not Found"),
+                else => return req.respond(.@"Internal Server Error"),
+            };
 
-        const fs_stat = file_handle.stat() catch return req.respond(.@"Internal Server Error");
-        const file = Response.File{ .file = file_handle, .len = fs_stat.size };
-        return req.respond_from(.OK, file);
+            const fs_stat = file_handle.stat() catch return req.respond(.@"Internal Server Error");
+            const file = Response.File{ .file = file_handle, .len = fs_stat.size };
+            return req.respond_from(.OK, file);
+        } else if (req.method == .post) {
+            const req_body = full_req.body orelse return req.respond(.@"Unprocessable Content");
+
+            const file_handle = dir.createFile(file_name, .{ .exclusive = true }) catch |err| switch (err) {
+                error.PathAlreadyExists => return req.respond(.Conflict),
+                else => return req.respond(.@"Internal Server Error"),
+            };
+            defer file_handle.close();
+
+            file_handle.writeAll(req_body) catch return req.respond(.@"Internal Server Error");
+
+            return req.respond(.Created);
+        } else {
+            return req.respond(.@"Method Not Allowed");
+        }
     }
 
     return req.respond(.@"Not Found");
@@ -251,10 +265,14 @@ const Request = struct {
         log.debug("Content-Length: {?d}", .{body_len});
 
         const body = if (body_len orelse 0 > 0) b: {
-            const req_body = reader.readAllAlloc(alloc, body_len.?) catch |err| switch (err) {
-                error.StreamTooLong => return Error.MalformedRequest,
-                else => return err,
-            };
+            log.debug("Reading body for size: {?d}", .{body_len});
+
+            const to_read = body_len.?;
+            var body_buf = try std.ArrayListUnmanaged(u8).initCapacity(alloc, to_read);
+            body_buf.expandToCapacity();
+            try reader.readNoEof(body_buf.items);
+            const req_body = try body_buf.toOwnedSlice(alloc);
+
             log.debug("Body: len={d} head={s}", .{ req_body.len, req_body[0..@min(42, req_body.len)] });
             break :b req_body;
         } else null;
