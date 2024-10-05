@@ -8,19 +8,27 @@ pub fn main() !void {
     });
     defer listener.deinit();
 
+    var pool: thread.Pool = undefined;
+    try pool.init(.{ .allocator = alloc.allocator() });
 
     while (true) {
-        const ally = alloc.allocator();
-
         const connection = try listener.accept();
-        log.debug("client connected from {}!", .{connection.address});
+        try pool.spawn(handle_connection, .{ alloc.allocator(), connection });
+    }
+}
 
-        const res = try handle_request(ally, connection.stream.reader());
-        defer res.deinit(ally);
-        log.debug("Response: {}", .{res.status});
+fn handle_connection(alloc: Alloc, connection: net.Server.Connection) void {
+    log.debug("client connected from {}!", .{connection.address});
 
-        try res.send(connection.stream.writer());
+    const res = handle_request(alloc, connection.stream.reader()) catch @panic("oom");
+    defer res.deinit(alloc);
+    log.debug("Response: {}", .{res.status});
+
+    if (res.send(connection.stream.writer())) |_| {
         connection.stream.close();
+    } else |err| switch (err) {
+        error.BrokenPipe => {},
+        else => @panic("oops"),
     }
 }
 
@@ -347,3 +355,4 @@ const Alloc = mem.Allocator;
 const log = std.log;
 const mem = std.mem;
 const net = std.net;
+const thread = std.Thread;
